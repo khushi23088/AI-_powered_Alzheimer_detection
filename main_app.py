@@ -1,0 +1,457 @@
+import streamlit as st
+import tensorflow as tf
+from PIL import Image
+import numpy as np
+import mysql.connector
+from fpdf import FPDF
+import io
+import os
+import pandas as pd
+from datetime import datetime
+from streamlit_option_menu import option_menu 
+
+# Database connection settings 
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "Root",
+    "database": "alzheimer_db" 
+}
+
+# Define the Alzheimer's stages 
+CLASS_NAMES = ['Non Demented', 'Very Mild Demented', 'Mild Demented', 'Moderate Demented']
+MODEL_PATH = 'model.h5'
+IMG_DIM = 176 
+
+# Set Streamlit page configuration
+st.set_page_config(
+    page_title="Alzheimer Disease Predictor", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for styling
+st.markdown("""
+<style>
+.stApp {
+    background-color: 212529; /* Light Gray Background */
+}
+.sidebar .sidebar-content {
+    background-color: #e9ecef; /* Slightly darker sidebar */
+}
+h1 {
+    color: #007bff; /* Primary Blue for headings */
+    text-align: center;
+}
+.stForm {
+    padding: 20px;
+    border-radius: 10px;
+    background-color: #ffffff; 
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+.report-card {
+    border-left: 5px solid #17a2b8; /* Teal border for prediction result */
+    padding: 15px;
+    border-radius: 5px;
+    background-color: 212529;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+}
+.stMarkdown h3 {
+    color: #17a2b8; /* Teal color for subheadings */
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# Database Manager Class
+
+class DatabaseManager:
+    """Handles all MySQL connection and operations."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.conn = None
+        self.cursor = None
+
+    def connect(self):
+        try:
+            self.conn = mysql.connector.connect(**self.config)
+            self.cursor = self.conn.cursor()
+            return True
+        except mysql.connector.Error as err:
+            st.error(f"Database connection error: {err}. Please check MySQL server and credentials.")
+            return False
+
+    def insert_prediction(self, name, age, result, confidence):
+        if not self.connect():
+            return
+        
+        # NOTE: Using 'patients' table
+        sql = "INSERT INTO patients (Name, Age, Result, Confidence, Created_At) VALUES (%s, %s, %s, %s, NOW())"
+        data = (name, age, result, float(confidence))
+
+        try:
+            self.cursor.execute(sql, data)
+            self.conn.commit()
+            st.sidebar.success("Prediction recorded in database.")
+        except mysql.connector.Error as err:
+            st.error(f"Failed to insert data: {err}")
+        finally:
+            self.close()
+
+    def fetch_all_records(self):
+        if not self.connect():
+            return pd.DataFrame()
+        
+        # NOTE: Using 'patients' table
+        sql = "SELECT Name, Age, Result, Confidence, Created_At FROM patients ORDER BY Created_At DESC"
+        
+        try:
+            self.cursor.execute(sql)
+            results = self.cursor.fetchall()
+            df = pd.DataFrame(results, columns=["Name", "Age", "Prediction Result", "Confidence", "Date"])
+            return df
+        except mysql.connector.Error as err:
+            st.error(f"Error fetching data: {err}")
+            return pd.DataFrame()
+        finally:
+            self.close()
+
+    def close(self):
+        if self.conn and self.conn.is_connected():
+            self.cursor.close()
+            self.conn.close()
+
+
+# Model Loading
+
+@st.cache_resource
+def load_model_once(path):
+    try:
+        model = tf.keras.models.load_model(path)
+        return model
+    except OSError as e:
+        st.error(f"Critical Error: Model file '{MODEL_PATH}' not found. Please train the model and save it as '{MODEL_PATH}'.")
+        st.stop()
+
+model = load_model_once(MODEL_PATH)
+
+
+#  Image Preprocessing & Prediction 
+
+def preprocess_and_predict(uploaded_image):
+    # PIL image preprocessing
+    image = Image.open(uploaded_image).convert('RGB')
+    image = image.resize((IMG_DIM, IMG_DIM))
+    
+    # NumPy/TensorFlow preprocessing
+    image_array = np.array(image) / 255.0  
+    image_array = np.expand_dims(image_array, axis=0) 
+
+    # Predict
+    prediction = model.predict(image_array)
+    predicted_class_index = np.argmax(prediction)
+    predicted_class = CLASS_NAMES[predicted_class_index]
+    confidence_score = float(np.max(prediction)) * 100
+
+    return predicted_class, confidence_score, image
+
+
+#  PDF Generator Class 
+
+class ReportPDF(FPDF):
+    """Custom FPDF class aligned with the project's professional aesthetic."""
+    def header(self):
+        self.set_font('Arial', 'B', 14)
+        self.set_fill_color(23, 162, 184) # Teal color
+        self.cell(0, 10, 'Neuro-Insight Alzheimer Disease Predictor: Clinical Report', 0, 1, 'C', fill=True)
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.set_text_color(100, 100, 100)
+        self.cell(0, 10, f'Generated by AI-Powered System - {datetime.now().strftime("%Y-%m-%d")}', 0, 0, 'C')
+        self.cell(0, 10, 'Page %s' % self.page_no(), 0, 0, 'R')
+
+    def chapter_title(self, title):
+        self.set_font('Arial', 'B', 12)
+        self.set_text_color(0, 0, 0)
+        self.cell(0, 8, title, 0, 1, 'L')
+        self.set_line_width(0.3)
+        self.line(10, self.get_y(), 200, self.get_y())
+        self.ln(3)
+
+    def chapter_body(self, body):
+        self.set_font('Arial', '', 10)
+        self.set_text_color(50, 50, 50)
+        self.multi_cell(0, 6, body)
+        self.ln(2)
+
+def create_pdf_report(name, age, result, confidence, temp_image_path):
+    pdf = ReportPDF()
+    pdf.add_page()
+
+    # Patient/Diagnostic Info Section
+    pdf.chapter_title('PATIENT & DIAGNOSTIC SUMMARY')
+    pdf.chapter_body(f'Patient Name: {name}')
+    pdf.chapter_body(f'Age: {age} years')
+    pdf.chapter_body(f'Scan Date: {datetime.now().strftime("%Y-%m-%d")}')
+    pdf.ln(5)
+
+    pdf.chapter_title('PREDICTION RESULT')
+    pdf.set_font('Arial', 'B', 14)
+    pdf.set_text_color(200, 0, 0) if "Demented" in result else pdf.set_text_color(0, 150, 50)
+    pdf.cell(0, 10, f'Classification: {result}', 0, 1, 'L')
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font('Arial', '', 10)
+    pdf.chapter_body(f'Confidence Score: {confidence:.2f}%')
+    pdf.ln(5)
+
+    # MRI Visualization Section
+    pdf.chapter_title('NEUROIMAGING ANALYSIS')
+    pdf.chapter_body('The following image was analyzed by the Convolutional Neural Network (CNN) model:')
+    
+    # Embed image from temporary path
+    if os.path.exists(temp_image_path):
+        img_width = 80
+        pdf.image(temp_image_path, x=(210 - img_width) / 2, y=pdf.get_y(), w=img_width)
+        pdf.ln(img_width + 5)
+    else:
+        pdf.chapter_body("Error: Image not available for embedding.")
+
+    # Precautionary Steps Section
+    pdf.chapter_title('RECOMMENDATIONS & PRECAUTIONS')
+    precautions = [
+        "1. Mental Stimulation: Engage in activities like puzzles, reading, and learning new skills.",
+        "2. Physical Activity: Regular exercise is crucial for brain and cardiovascular health.",
+        "3. Diet: Follow a Mediterranean or MIND diet rich in vegetables, fish, and nuts.",
+        "4. Social Engagement: Maintain strong social connections to support cognitive function.",
+        "5. Medical Follow-up: Consult with a neurologist for further clinical evaluation and screening."
+    ]
+    pdf.set_list_indent(10)
+    for step in precautions:
+        pdf.chapter_body(step)
+    
+    # Output PDF as bytes
+    pdf_bytes = pdf.output(dest='S')
+    return bytes(pdf_bytes)
+
+
+#  Streamlit Main App Logic 
+
+db_manager = DatabaseManager(DB_CONFIG)
+
+def main():
+    # Use st.session_state for navigation
+    if 'page' not in st.session_state:
+        st.session_state.page = "Home"
+
+    st.title("Neuro-Insight Alzheimer Disease Predictor")
+    st.markdown("<h3 style='text-align: center;'>AI-Powered Early Prediction of Alzheimer using Neuroimaging</h3>", unsafe_allow_html=True)
+    
+    #  Sidebar Navigation 
+    with st.sidebar:
+        selected = option_menu(
+            menu_title="Navigation",
+            options=["Home", "Alzheimer Detection", "Patient Records", "About Us"],
+            icons=["house", "book", "table", "info-circle"],
+            menu_icon="cast",
+            default_index=0,
+        )
+    st.session_state.page = selected
+
+
+    #  Page Content 
+
+    if st.session_state.page == "Home":
+        st.markdown("""
+            <style>
+                .title-container {
+                    text-align: center;
+                    margin-top: -60px;
+                }
+                .hero-img {
+                    border-radius: 15px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                    max-width: 100%;
+                    height: auto;
+                }
+                .feature-card {
+                    border: 1px solid #eee;
+                    border-radius: 12px;
+                    padding: 1rem;
+                    background: #ffffff; /* White background for visibility */
+                    backdrop-filter: blur(10px);
+                    box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
+                    margin-bottom: 1rem;
+                    color: #212629;
+                }
+            </style>
+        """, unsafe_allow_html=True)
+
+        st.markdown('<div></div><div class="title-container"><h1>🧠 Welcome to Alzheimer\'s Disease Detection</h1></div>', unsafe_allow_html=True)
+        # Assuming 'hero.png' is in the root directory for simplicity
+        st.image("./images/hero.jpg", use_container_width=True, caption="AI-powered Alzheimer Detection System")
+
+        st.markdown("---")
+
+        st.markdown("### 🎯 Key Features")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown('<div class="feature-card"><h4>⚡ Fast & Accurate</h4><p>Deep learning ensures reliable predictions within seconds.</p></div>', unsafe_allow_html=True)
+        with col2:
+            st.markdown('<div class="feature-card"><h4>📁 Patient Records</h4><p>All predictions are saved for future reference and diagnosis tracking.</p></div>', unsafe_allow_html=True)
+        with col1:
+            st.markdown('<div class="feature-card"><h4>🧾 PDF Reports</h4><p>Generate downloadable reports for sharing with doctors or caregivers.</p></div>', unsafe_allow_html=True)
+        with col2:
+            st.markdown('<div class="feature-card"><h4>💡 AI-driven Insights</h4><p>Backed by convolutional neural networks and medical datasets.</p></div>', unsafe_allow_html=True)
+
+
+    elif st.session_state.page == "Alzheimer Detection":
+        st.title("🔎 Alzheimer Detection Web App")
+        
+        #  Input Form is now in the Main Area 
+        with st.form(key='patient_form', clear_on_submit=True):
+            st.header("Patient Data Input")
+            col_name, col_age = st.columns(2)
+            with col_name:
+                patient_name = st.text_input('Patient Name', value="John Doe")
+            with col_age:
+                patient_age = st.number_input('Age', min_value=1, max_value=120, value=65)
+            
+            st.markdown("---")
+            uploaded_file = st.file_uploader('Upload MRI Scan (.jpg, .png)', type=["jpg", "jpeg", "png"])
+            
+            submit_button = st.form_submit_button("Run Prediction")
+
+        #  Prediction Logic 
+        if submit_button:
+            if uploaded_file is None:
+                st.warning("Please upload an MRI scan image to proceed.")
+                return
+
+            # 1. Run Prediction
+            with st.spinner("Analyzing neuroimage..."):
+                predicted_class, confidence, image = preprocess_and_predict(uploaded_file)
+            
+            st.markdown("### Prediction Analysis")
+            
+            # Determine color for the result card
+            if "Moderate" in predicted_class:
+                result_color = "#dc3545" # Red (Severe)
+            elif "Mild" in predicted_class or "Very Mild" in predicted_class:
+                result_color = "#ffc107" # Yellow (Warning)
+            else:
+                result_color = "#28a745" # Green (Normal/Low Risk)
+                
+            # Display Prediction Result Card
+            st.markdown(f"""
+            <div class="report-card" style="border-left: 5px solid {result_color};">
+                <h3>Predicted Status: {predicted_class}</h3>
+                <p style="font-size: 1.1em; color: #495057;">
+                    <strong>Confidence:</strong> {confidence:.2f}%
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # 2. Display Image and Interpretation
+            col_img, col_interp = st.columns([1, 2])
+            
+            with col_img:
+                st.image(image, caption='Uploaded MRI Scan', use_container_width=True)
+                st.markdown(f"**Name:** {patient_name}")
+                st.markdown(f"**Age:** {patient_age}")
+                
+            with col_interp:
+                st.markdown("### Clinical Interpretation")
+                if "Non Demented" in predicted_class:
+                    st.info("The neuroimaging analysis suggests a normal cognitive state. Continue proactive brain health measures.")
+                elif "Very Mild Demented" in predicted_class:
+                    st.warning("Early signs of cognitive impairment detected. Immediate clinical consultation is strongly recommended.")
+                elif "Mild Demented" in predicted_class:
+                    st.error("Moderate signs of atrophy/impairment detected. Urgent medical review required for diagnostic confirmation and intervention planning.")
+                elif "Moderate Demented" in predicted_class:
+                    st.error("Severe neurodegenerative patterns detected. Immediate specialist intervention is necessary.")
+
+            # 3. Save to Database
+            db_manager.insert_prediction(patient_name, patient_age, predicted_class, confidence / 100)
+
+            # 4. Generate PDF Report
+            # Streamlit requires image to be saved locally for fpdf to read it easily
+            temp_image_path = "temp_mri_scan.png"
+            image.save(temp_image_path)
+            
+            pdf_bytes = create_pdf_report(patient_name, patient_age, predicted_class, confidence, temp_image_path)
+            
+            st.download_button(
+                label="Download Clinical Report (PDF)",
+                data=pdf_bytes,
+                file_name=f"AD_Report_{patient_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf"
+            )
+            # Clean up temporary file
+            os.remove(temp_image_path)
+            
+    elif st.session_state.page == "Patient Records":
+        st.title("📋 Patient Records History")
+        st.markdown("---")
+        
+        st.markdown("### Filter & Display")
+        
+        # Use st.session_state to manage the refresh button
+        if st.button("Refresh All Records"):
+             st.session_state.refresh_data = True
+
+        df_records = db_manager.fetch_all_records()
+        
+        if not df_records.empty:
+            st.dataframe(df_records, use_container_width=True)
+            
+            st.markdown("---")
+            st.markdown("### Summary Statistics")
+            col_count, col_avg_age = st.columns(2)
+            
+            total_records = len(df_records)
+            avg_age = df_records['Age'].mean()
+            
+            
+            # Simple dementia ratio calculation
+            demented_count = df_records['Prediction Result'].str.contains('Demented').sum()
+            demented_ratio = (demented_count / total_records) * 100 if total_records > 0 else 0
+
+            col_count.metric("Total Records", total_records)
+            col_avg_age.metric("Average Patient Age", f"{avg_age:.1f}" if not pd.isna(avg_age) else "N/A")
+            
+            st.metric("Patients with Dementia Signs", f"{demented_ratio:.1f}%", delta_color="inverse")
+
+        else:
+            st.info("No prediction records found in the database. Run the detection tool to populate.")
+
+    elif st.session_state.page == "About Us":
+        st.title("ℹ️ About the Neuro-Insight Alzheimer Disease Predictor")
+        st.markdown("---")
+        
+        st.markdown("""
+        ### Project Overview (CSE Data Science Final Year)
+        This application implements an AI-driven solution for the early prediction and classification of Alzheimer's Disease (AD) stages using Convolutional Neural Networks (CNNs) trained on neuroimaging data (MRI scans).
+        Done by - KHUSHI KUMARI (1AH22CD028),PALACHARLA PRAGNADEVI (1AH22CD036), PUGALENTHI S (1AH22CD043), SOWMYA M (1AH22CD041) under the guidance of Mrs. AARTHI K, Assistant Professor, CSE - Data Science, ACS College of Engineering.
+        
+        #### **Technical Stack:**
+        * **Core Model:** Optimized CNN Architecture (TensorFlow/Keras with Separable Convolutions, Batch Normalization, and Dropout).
+        * **Frontend:** Streamlit for a fast, Python-native user interface.
+        * **Backend Database:** MySQL for persistent storage of patient records.
+        * **Reporting:** FPDF for generating non-editable, professional diagnostic reports.
+        
+        #### **Classification Stages:**
+        The model classifies the MRI scans into four distinct stages:
+        1.  Non Demented
+        2.  Very Mild Demented
+        3.  Mild Demented
+        4.  Moderate Demented
+
+        **Disclaimer:** This is a final year academic project and is for informational purposes only. It is not a substitute for professional medical diagnosis or advice. Always consult a qualified medical professional for health concerns.
+        """)
+
+if __name__ == '__main__':
+    main()
