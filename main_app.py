@@ -19,7 +19,7 @@ DB_CONFIG = {
 }
 
 # Define the Alzheimer's stages 
-CLASS_NAMES = ['Non Demented', 'Very Mild Demented', 'Mild Demented', 'Moderate Demented']
+CLASS_NAMES = ['Mild Demented', 'Moderate Demented', 'Non Demented', 'Very Mild Demented']
 MODEL_PATH = 'model.h5'
 IMG_DIM = 176 
 
@@ -229,13 +229,15 @@ def create_pdf_report(name, age, result, confidence, temp_image_path):
         "4. Social Engagement: Maintain strong social connections to support cognitive function.",
         "5. Medical Follow-up: Consult with a neurologist for further clinical evaluation and screening."
     ]
-    pdf.set_list_indent(10)
+    
     for step in precautions:
+        pdf.set_x(pdf.get_x() + 10)  
         pdf.chapter_body(step)
+        pdf.set_x(10)  
     
     # Output PDF as bytes
     pdf_bytes = pdf.output(dest='S')
-    return bytes(pdf_bytes)
+    return pdf_bytes.encode('latin1')
 
 
 #  Streamlit Main App Logic 
@@ -289,7 +291,7 @@ def main():
                 }
             </style>
         """, unsafe_allow_html=True)
-
+        st.markdown("---")
         st.markdown('<div></div><div class="title-container"><h1>🧠 Welcome to Alzheimer\'s Disease Detection</h1></div>', unsafe_allow_html=True)
         # Assuming 'hero.png' is in the root directory for simplicity
         st.image("./images/hero.jpg", use_container_width=True, caption="AI-powered Alzheimer Detection System")
@@ -310,10 +312,10 @@ def main():
 
     elif st.session_state.page == "Alzheimer Detection":
         st.title("🔎 Alzheimer Detection Web App")
-        
+                
         #  Input Form is now in the Main Area 
         with st.form(key='patient_form', clear_on_submit=True):
-            st.header("Patient Data Input")
+            st.markdown("<h3>Patient Data Input</h3>", unsafe_allow_html=True)
             col_name, col_age = st.columns(2)
             with col_name:
                 patient_name = st.text_input('Patient Name', value="John Doe")
